@@ -559,6 +559,20 @@ def _read_shell_token(command: str, start: int) -> tuple[str, int]:
     return command[start:i], i
 
 
+def _has_explicit_noninteractive_sudo(command: str) -> bool:
+    """Return True when a real sudo invocation already includes -n.
+
+    Explicit non-interactive sudo should fail fast instead of being rewritten to
+    the password-fed sudo path, which can trigger Hermes' interactive password
+    prompt.
+    """
+    statement_start = r"(?:^|[\n;|&()])\s*"
+    env_assign = r"(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|\S+)\s+)*"
+    sudo_word = r"sudo\s+"
+    noninteractive = r"(?:-[A-Za-z]*n[A-Za-z]*\b|--non-interactive\b)"
+    return re.search(statement_start + env_assign + sudo_word + noninteractive, command) is not None
+
+
 def _rewrite_real_sudo_invocations(command: str) -> tuple[str, bool]:
     """Rewrite only real unquoted sudo command words, not plain text mentions."""
     out: list[str] = []
@@ -848,6 +862,8 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     """
     if command is None:
         return None, None
+    if _has_explicit_noninteractive_sudo(command):
+        return command, None
     transformed, has_real_sudo = _rewrite_real_sudo_invocations(command)
     if not has_real_sudo:
         return command, None

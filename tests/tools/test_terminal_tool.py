@@ -64,6 +64,38 @@ def test_actual_sudo_after_leading_env_assignment_is_rewritten(monkeypatch):
     assert sudo_stdin == "testpass\n"
 
 
+def test_sudo_noninteractive_flag_skips_prompt_and_rewrite(monkeypatch):
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+    def _fail_prompt(*_args, **_kwargs):
+        raise AssertionError("interactive sudo prompt should not run for sudo -n")
+
+    monkeypatch.setattr(terminal_tool, "_prompt_for_sudo_password", _fail_prompt)
+
+    command = "sudo -n lsof -nP"
+    transformed, sudo_stdin = terminal_tool._transform_sudo_command(command)
+
+    assert transformed == command
+    assert sudo_stdin is None
+
+
+def test_sudo_noninteractive_flag_after_env_assignment_skips_prompt_and_rewrite(monkeypatch):
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+    def _fail_prompt(*_args, **_kwargs):
+        raise AssertionError("interactive sudo prompt should not run for DEBUG=1 sudo -n")
+
+    monkeypatch.setattr(terminal_tool, "_prompt_for_sudo_password", _fail_prompt)
+
+    command = "DEBUG=1 sudo -n whoami"
+    transformed, sudo_stdin = terminal_tool._transform_sudo_command(command)
+
+    assert transformed == command
+    assert sudo_stdin is None
+
+
 def test_explicit_empty_sudo_password_tries_empty_without_prompt(monkeypatch):
     monkeypatch.setenv("SUDO_PASSWORD", "")
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
