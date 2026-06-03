@@ -18,6 +18,24 @@ describe('createSlashHandler', () => {
     expect(getOverlayState().picker).toBe(true)
   })
 
+  it('passes a managed /new reset reason into session lifecycle', () => {
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)('/new')).toBe(true)
+    expect(getOverlayState().confirm).toBeTruthy()
+    getOverlayState().confirm?.onConfirm()
+    expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', 'manual_new')
+  })
+
+  it('passes a managed /clear reset reason into session lifecycle', () => {
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)('/clear')).toBe(true)
+    expect(getOverlayState().confirm).toBeTruthy()
+    getOverlayState().confirm?.onConfirm()
+    expect(ctx.session.newSession).toHaveBeenCalledWith(undefined, 'manual_clear')
+  })
+
   it('treats /provider as a local /model alias', () => {
     const ctx = buildCtx()
 

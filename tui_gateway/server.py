@@ -2429,10 +2429,11 @@ def _(rid, params: dict) -> dict:
 @method("session.close")
 def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
+    end_reason = str(params.get("end_reason") or "tui_close")
     session = _sessions.pop(sid, None)
     if not session:
         return _ok(rid, {"closed": False})
-    _finalize_session(session)
+    _finalize_session(session, end_reason=end_reason)
     try:
         from tools.approval import unregister_gateway_notify
 

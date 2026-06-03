@@ -465,6 +465,31 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_session_close_forwards_end_reason_to_db(monkeypatch):
+    reasons = []
+
+    class _FakeDB:
+        def end_session(self, session_key, end_reason):
+            reasons.append((session_key, end_reason))
+
+    server._sessions["sid"] = _session(agent=None)
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.close",
+                "params": {"session_id": "sid", "end_reason": "manual_new"},
+            }
+        )
+        assert resp["result"]["closed"] is True
+        assert reasons == [("session-key", "manual_new")]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_init_session_fires_reset_hook(monkeypatch):
     hooks = []
 

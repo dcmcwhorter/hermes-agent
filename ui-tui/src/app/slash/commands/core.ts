@@ -120,7 +120,7 @@ export const coreCommands: SlashCommand[] = [
 
       const commit = () => {
         patchUiState({ status: 'forging session…' })
-        ctx.session.newSession(isNew ? 'new session started' : undefined)
+        ctx.session.newSession(isNew ? 'new session started' : undefined, isNew ? 'manual_new' : 'manual_clear')
       }
 
       if (NO_CONFIRM_DESTRUCTIVE) {

@@ -9,6 +9,7 @@ import { introMsg, toTranscriptMessages } from '../domain/messages.js'
 import { ZERO } from '../domain/usage.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
+  PromptSubmitResponse,
   SessionCloseResponse,
   SessionCreateResponse,
   SessionResumeResponse,
@@ -18,12 +19,45 @@ import { asRpcResult } from '../lib/rpc.js'
 import type { Msg, PanelSection, SessionInfo, Usage } from '../types.js'
 
 import type { ComposerActions, GatewayRpc, StateSetter } from './interfaces.js'
+import {
+  appendManagedAck,
+  managedAgentName,
+  managedLifecyclePrompt,
+  managedProtocolEnabled,
+  managedSessionDir,
+  type ManagedInboxItem
+} from './managedInbox.js'
 import { patchOverlayState } from './overlayStore.js'
 import { turnController } from './turnController.js'
 import { patchTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
 const usageFrom = (info: null | SessionInfo): Usage => (info?.usage ? { ...ZERO, ...info.usage } : ZERO)
+
+export type ManualSessionResetTrigger = 'manual_clear' | 'manual_new'
+
+const MANUAL_RESET_MESSAGES: Record<ManualSessionResetTrigger, string> = {
+  manual_clear: 'manual /clear requested inside managed TUI; create a fresh session, reload briefing/messages/tasks, and run bounded startup duties before continuing autonomous work.',
+  manual_new: 'manual /new requested inside managed TUI; create a fresh session, reload briefing/messages/tasks, and run bounded startup duties before continuing autonomous work.'
+}
+
+export const managedResetLifecycleItemId = (trigger: ManualSessionResetTrigger, sessionId: string) =>
+  `managed-reset-${trigger}-${sessionId}`
+
+export const managedResetLifecycleItem = (
+  trigger: ManualSessionResetTrigger,
+  sessionId: string
+): ManagedInboxItem => ({
+  id: managedResetLifecycleItemId(trigger, sessionId),
+  kind: 'startup',
+  text: MANUAL_RESET_MESSAGES[trigger]
+})
+
+export const managedResetLifecyclePrompt = (
+  trigger: ManualSessionResetTrigger,
+  sessionId: string,
+  agent = managedAgentName()
+) => managedLifecyclePrompt('startup', managedResetLifecycleItem(trigger, sessionId), agent)
 
 export const writeActiveSessionFile = (sessionId: null | string, file = process.env.HERMES_TUI_ACTIVE_SESSION_FILE) => {
   if (!file || !sessionId) {
@@ -85,8 +119,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   } = opts
 
   const closeSession = useCallback(
-    (targetSid?: null | string) =>
-      targetSid ? rpc<SessionCloseResponse>('session.close', { session_id: targetSid }) : Promise.resolve(null),
+    (targetSid?: null | string, endReason = 'tui_close') =>
+      targetSid ? rpc<SessionCloseResponse>('session.close', { end_reason: endReason, session_id: targetSid }) : Promise.resolve(null),
     [rpc]
   )
 
@@ -122,7 +156,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   )
 
   const newSession = useCallback(
-    async (msg?: string) => {
+    async (msg?: string, resetTrigger?: ManualSessionResetTrigger) => {
       const setup = await rpc<SetupStatusResponse>('setup.status', {})
 
       if (setup?.provider_configured === false) {
@@ -132,7 +166,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         return
       }
 
-      await closeSession(getUiState().sid)
+      await closeSession(getUiState().sid, resetTrigger ?? 'tui_close')
 
       const r = await rpc<SessionCreateResponse>('session.create', { cols: colsRef.current })
 
@@ -155,6 +189,40 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
       if (info) {
         setHistoryItems([introMsg(info)])
+      }
+
+      if (resetTrigger && managedProtocolEnabled()) {
+        const dir = managedSessionDir()
+        const synthetic = managedResetLifecycleItem(resetTrigger, r.session_id)
+
+        appendManagedAck(dir, {
+          inbox_id: synthetic.id,
+          status: 'received',
+          synthetic: true,
+          trigger: resetTrigger
+        })
+        rpc<PromptSubmitResponse>('prompt.submit', {
+          session_id: r.session_id,
+          text: managedResetLifecyclePrompt(resetTrigger, r.session_id)
+        })
+          .then(() => {
+            appendManagedAck(dir, {
+              inbox_id: synthetic.id,
+              status: 'submitted',
+              synthetic: true,
+              trigger: resetTrigger
+            })
+          })
+          .catch((e: Error) => {
+            appendManagedAck(dir, {
+              error: e.message,
+              inbox_id: synthetic.id,
+              status: 'error',
+              synthetic: true,
+              trigger: resetTrigger
+            })
+            sys(`AI-Swarm managed startup failed after ${resetTrigger === 'manual_new' ? '/new' : '/clear'}: ${e.message}`)
+          })
       }
 
       if (info?.credential_warning) {
