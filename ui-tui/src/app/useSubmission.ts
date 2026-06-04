@@ -16,13 +16,52 @@ import { PASTE_SNIPPET_RE } from '../protocol/paste.js'
 import type { Msg } from '../types.js'
 
 import type { ComposerActions, ComposerRefs, ComposerState, PasteSnippet } from './interfaces.js'
+import {
+  appendManagedAck,
+  latestManagedInboxItem,
+  MANAGED_LIFECYCLE_TRIGGERS,
+  managedAgentName,
+  managedEventPrompt,
+  managedLifecyclePrompt,
+  managedProtocolEnabled,
+  managedSessionDir,
+  pendingManagedInboxItems,
+  writeManagedStatus
+} from './managedInbox.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
 const DOUBLE_ENTER_MS = 450
 const SESSION_BUSY_RE = /session busy|waiting for model response/i
 
+type ManagedSubmitAckState = {
+  accepted?: boolean
+  busyRetry?: boolean
+  failed?: boolean
+  missingSession?: boolean
+}
+
 const isSessionBusyError = (e: unknown) => e instanceof Error && SESSION_BUSY_RE.test(e.message)
+
+export const managedSubmitAckStatus = (state: ManagedSubmitAckState) => {
+  if (state.missingSession) {
+    return 'blocked'
+  }
+
+  if (state.failed) {
+    return 'error'
+  }
+
+  if (state.busyRetry) {
+    return 'queued'
+  }
+
+  if (state.accepted) {
+    return 'started'
+  }
+
+  return 'submitted'
+}
 
 const expandSnips = (snips: PasteSnippet[]) => {
   const byLabel = new Map<string, string[]>()
@@ -54,6 +93,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
   const lastEmptyAt = useRef(0)
   const typingIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const managedSeenRef = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     if (typingIdleTimer.current) {
@@ -85,13 +125,31 @@ export function useSubmission(opts: UseSubmissionOptions) {
   }, [composerState.input, composerState.inputBuf])
 
   const send = useCallback(
-    (text: string, showUserMessage = true) => {
+    (
+      text: string,
+      showUserMessage = true,
+      managedAck?: { dir: string; inboxId?: string; trigger?: string }
+    ) => {
       const expand = expandSnips(composerState.pasteSnips)
 
-      const startSubmit = (displayText: string, submitText: string, showUserMessage = true) => {
+      const startSubmit = (
+        displayText: string,
+        submitText: string,
+        showUserMessage = true,
+        managedAck?: { dir: string; inboxId?: string; trigger?: string }
+      ) => {
         const sid = getUiState().sid
 
         if (!sid) {
+          if (managedAck?.dir && managedAck?.trigger) {
+            appendManagedAck(managedAck.dir, {
+              trigger: managedAck.trigger,
+              inbox_id: managedAck.inboxId,
+              status: managedSubmitAckStatus({ missingSession: true }),
+              error: 'session_not_ready'
+            })
+          }
+
           return sys('session not ready yet')
         }
 
@@ -107,12 +165,40 @@ export function useSubmission(opts: UseSubmissionOptions) {
         turnController.bufRef = ''
         turnController.interrupted = false
 
-        gw.request<PromptSubmitResponse>('prompt.submit', { session_id: sid, text: submitText }).catch((e: Error) => {
+        gw.request<PromptSubmitResponse>('prompt.submit', { session_id: sid, text: submitText })
+          .then(() => {
+            if (managedAck?.dir && managedAck?.trigger) {
+              appendManagedAck(managedAck.dir, {
+                trigger: managedAck.trigger,
+                inbox_id: managedAck.inboxId,
+                status: managedSubmitAckStatus({ accepted: true })
+              })
+            }
+          })
+          .catch((e: Error) => {
           if (isSessionBusyError(e)) {
             composerActions.enqueue(submitText)
             patchUiState({ busy: true, status: 'queued for next turn' })
 
+            if (managedAck?.dir && managedAck?.trigger) {
+              appendManagedAck(managedAck.dir, {
+                trigger: managedAck.trigger,
+                inbox_id: managedAck.inboxId,
+                status: managedSubmitAckStatus({ busyRetry: true }),
+                error: e.message
+              })
+            }
+
             return sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
+          }
+
+          if (managedAck?.dir && managedAck?.trigger) {
+            appendManagedAck(managedAck.dir, {
+              trigger: managedAck.trigger,
+              inbox_id: managedAck.inboxId,
+              status: managedSubmitAckStatus({ failed: true }),
+              error: e.message
+            })
           }
 
           sys(`error: ${e.message}`)
@@ -132,7 +218,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       gw.request<InputDetectDropResponse>('input.detect_drop', { session_id: sid, text })
         .then(r => {
           if (!r?.matched) {
-            return startSubmit(text, expand(text), showUserMessage)
+            return startSubmit(text, expand(text), showUserMessage, managedAck)
           }
 
           if (r.is_image) {
@@ -141,12 +227,52 @@ export function useSubmission(opts: UseSubmissionOptions) {
             turnController.pushActivity(`detected file: ${r.name}`)
           }
 
-          startSubmit(r.text || text, expand(r.text || text), showUserMessage)
+          startSubmit(r.text || text, expand(r.text || text), showUserMessage, managedAck)
         })
-        .catch(() => startSubmit(text, expand(text), showUserMessage))
+        .catch(() => startSubmit(text, expand(text), showUserMessage, managedAck))
     },
     [appendMessage, composerActions, composerState.pasteSnips, gw, maybeGoodVibes, setLastUserMsg, sys]
   )
+
+  useEffect(() => {
+    if (!managedProtocolEnabled()) {
+      return
+    }
+
+    const dir = managedSessionDir()
+
+    const pollManagedInbox = () => {
+      const live = getUiState()
+      writeManagedStatus(dir, {
+        agent: managedAgentName(),
+        busy: live.busy,
+        queue_depth: composerRefs.queueRef.current.length,
+        session_id: live.sid || null,
+        state: live.busy ? 'busy' : 'ready',
+        status: live.status || ''
+      })
+
+      if (!live.sid) {
+        return
+      }
+
+      for (const item of pendingManagedInboxItems(dir, managedSeenRef.current)) {
+        if (!item.id || !item.kind) {
+          continue
+        }
+
+        managedSeenRef.current.add(item.id)
+        appendManagedAck(dir, { trigger: item.kind, inbox_id: item.id, status: 'received' })
+        appendManagedAck(dir, { trigger: item.kind, inbox_id: item.id, status: 'submitted' })
+        send(managedEventPrompt(item), false, { dir, inboxId: item.id, trigger: item.kind })
+      }
+    }
+
+    pollManagedInbox()
+    const timer = setInterval(pollManagedInbox, 1000)
+
+    return () => clearInterval(timer)
+  }, [composerRefs.queueRef, send])
 
   const shellExec = useCallback(
     (cmd: string) => {
@@ -284,6 +410,29 @@ export function useSubmission(opts: UseSubmissionOptions) {
   const dispatchSubmission = useCallback(
     (full: string) => {
       if (!full.trim()) {
+        return
+      }
+
+      const trimmed = full.trim()
+
+      if (MANAGED_LIFECYCLE_TRIGGERS.has(trimmed) && managedProtocolEnabled()) {
+        composerActions.pushHistory(full)
+        composerActions.clearIn()
+        const dir = managedSessionDir()
+        const item = latestManagedInboxItem(dir, trimmed)
+
+        if (!item) {
+          appendManagedAck(dir, { trigger: trimmed, status: 'error', error: 'no_matching_inbox_item' })
+          sys(`AI-Swarm ${trimmed}: no matching managed inbox item found`)
+
+          return
+        }
+
+        appendManagedAck(dir, { trigger: trimmed, inbox_id: item.id, status: 'received' })
+        sys(`AI-Swarm ${trimmed}: managed inbox item loaded`)
+        appendManagedAck(dir, { trigger: trimmed, inbox_id: item.id, status: 'submitted' })
+        send(managedLifecyclePrompt(trimmed, item), false, { dir, inboxId: item.id, trigger: trimmed })
+
         return
       }
 
