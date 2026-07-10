@@ -10,6 +10,8 @@ const SESSION_BUSY_RE = /session busy|waiting for model response/i
 
 export const isSessionBusyError = (e: unknown) => e instanceof Error && SESSION_BUSY_RE.test(e.message)
 
+export type SubmitPromptStatus = 'submitted' | 'accepted' | 'session_busy' | 'missing_session' | 'error'
+
 export interface SubmitPromptDeps {
   appendMessage: (msg: Msg) => void
   enqueue: (text: string) => void
@@ -17,6 +19,7 @@ export interface SubmitPromptDeps {
   gw: GatewayClient
   setLastUserMsg: (value: string) => void
   sys: (text: string) => void
+  onStatus?: (status: SubmitPromptStatus) => void
 }
 
 // Optimistically flip the session to busy the INSTANT a prompt is accepted for
@@ -46,6 +49,7 @@ export function submitPrompt(text: string, deps: SubmitPromptDeps, showUserMessa
   const sid = getUiState().sid
 
   if (!sid) {
+    deps.onStatus?.('missing_session')
     return deps.sys('session not ready yet')
   }
 
@@ -56,6 +60,7 @@ export function submitPrompt(text: string, deps: SubmitPromptDeps, showUserMessa
     const liveSid = getUiState().sid
 
     if (!liveSid) {
+      deps.onStatus?.('missing_session')
       return deps.sys('session not ready yet')
     }
 
@@ -69,9 +74,11 @@ export function submitPrompt(text: string, deps: SubmitPromptDeps, showUserMessa
     patchUiState({ busy: true, status: 'running…' })
     turnController.bufRef = ''
     turnController.interrupted = false
+    deps.onStatus?.('submitted')
 
     deps.gw
       .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
+      .then(() => deps.onStatus?.('accepted'))
       .catch((e: Error) => {
         // Defensive: prompt.submit no longer rejects a mid-turn send with
         // "session busy" (the gateway queues it and returns success), but keep
@@ -80,12 +87,14 @@ export function submitPrompt(text: string, deps: SubmitPromptDeps, showUserMessa
         if (isSessionBusyError(e)) {
           deps.enqueue(submitText)
           patchUiState({ busy: true, status: 'queued for next turn' })
+          deps.onStatus?.('session_busy')
 
           return deps.sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
         }
 
         deps.sys(`error: ${e.message}`)
         patchUiState({ busy: false, status: 'ready' })
+        deps.onStatus?.('error')
       })
   }
 

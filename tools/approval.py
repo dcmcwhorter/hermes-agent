@@ -2080,7 +2080,8 @@ def _smart_approve(command: str, description: str) -> str:
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0,
-            max_tokens=16,
+            # AI-Swarm: reasoning-capable approval models need enough budget to emit final verdict.
+            max_tokens=64,
         )
 
         answer = (response.choices[0].message.content or "").strip().upper()

@@ -1138,43 +1138,36 @@ async def web_extract_tool(
         return tool_error(error_msg)
 
 
-# Convenience function to check Firecrawl credentials
+# Convenience function to check web-tool availability
 def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available.
+    """Check whether web tools can do useful work.
 
-    Used as the ``check_fn`` gate for the ``web_search`` and ``web_extract``
-    tool registry entries — so a plugin-registered provider that reports
-    ``is_available()`` must light the tools up even when no built-in backend
-    has credentials (issues #28651, #31873). Resolution funnels through
-    :func:`_is_backend_available`, which delegates non-legacy names to the
-    registry.
+    Search probes configured and plugin providers first. ``web_extract`` also
+    has a bounded direct-HTTP fallback, so the shared tool gate remains enabled
+    when no paid extraction backend is configured.
     """
     # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
     # ``None.lower()`` would raise. Mirrors ``_get_backend``.
     configured = (_load_web_config().get("backend") or "").lower().strip()
     if configured and _is_backend_available(configured):
         return True
-    # Any built-in backend with credentials present. This is a boolean OR, so
-    # unlike _get_backend() the probe order is irrelevant.
     if any(_is_backend_available(backend) for backend in _LEGACY_WEB_BACKENDS):
         return True
-    # Any plugin-registered provider the registry considers active for either
-    # capability. Delegating to the registry's own availability-filtered
-    # resolvers keeps a single authority for "is a custom provider usable"
-    # rather than re-implementing the walk here.
     try:
         from agent.web_search_registry import (
             get_active_search_provider,
             get_active_extract_provider,
         )
 
-        return (
+        if (
             get_active_search_provider() is not None
             or get_active_extract_provider() is not None
-        )
+        ):
+            return True
     except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
         logger.debug("web provider registry availability check failed: %s", exc)
-        return False
+
+    return True  # direct-HTTP extraction remains available without credentials
 
 
 if __name__ == "__main__":

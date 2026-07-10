@@ -15221,7 +15221,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             layout=layout,
             key_bindings=kb,
             style=style,
-            full_screen=False,
+            full_screen=os.environ.get("HERMES_PROMPT_TOOLKIT_FULLSCREEN") == "1",
             mouse_support=False,
             **({"output": _cpr_disabled_output} if _cpr_disabled_output is not None else {}),
             # Read from display.cli_refresh_interval (default 0 = disabled).
