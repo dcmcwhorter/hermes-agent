@@ -22,6 +22,12 @@ class _StubBudget:
 class _StubCompressor:
     last_prompt_tokens = 0
 
+    def __init__(self):
+        self.ingested = []
+
+    def ingest_messages(self, messages):
+        self.ingested.append(list(messages))
+
 
 class _StubAgent:
     """Minimal agent surface that ``finalize_turn`` reads from."""
@@ -171,6 +177,18 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert result["completed"] is False
     assert "cleanup_errors" not in result
 
+
+def test_clean_turn_ingests_context_engine_messages_after_persist():
+    agent = _StubAgent(raise_in=())
+    _run(agent)
+    assert len(agent.context_compressor.ingested) == 1
+    assert agent.context_compressor.ingested[0][0]["role"] == "user"
+
+
+def test_persist_failure_does_not_call_context_engine_ingest():
+    agent = _StubAgent(raise_in=("persist_session",))
+    _run(agent)
+    assert agent.context_compressor.ingested == []
 
 def test_text_response_on_last_allowed_call_is_completed():
     agent = _StubAgent(raise_in=())

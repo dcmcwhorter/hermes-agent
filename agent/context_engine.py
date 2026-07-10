@@ -165,6 +165,16 @@ class ContextEngine(ABC):
         self.last_total_tokens = 0
         self.compression_count = 0
 
+    def ingest_messages(self, messages: List[Dict[str, Any]]) -> None:
+        """Persist or reconcile the current in-memory transcript, if supported.
+
+        Called by the host during normal turn finalization, not only during
+        compaction. The default no-op preserves existing engines; LCM-style
+        engines can override this to keep their current-session store fresh even
+        when token pressure is too low to run ``compress()``.
+        """
+        return None
+
     # -- Optional: tools ---------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
