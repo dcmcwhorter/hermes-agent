@@ -1029,6 +1029,10 @@ class TestLaunchdServiceRecovery:
         )
 
         def fake_run(cmd, check=False, **kwargs):
+            if cmd[:3] == ["sudo", "-n", "launchctl"]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    1, cmd, stderr="sudo required"
+                )
             if cmd[:2] == ["launchctl", "bootstrap"]:
                 raise gateway_cli.subprocess.CalledProcessError(
                     5, cmd, stderr="Input/output error"
