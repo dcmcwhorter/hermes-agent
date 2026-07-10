@@ -129,6 +129,57 @@ class TestEndToEnd:
         assert "para 0 " in content
         assert "para 2999 " in content
 
+    def test_web_extract_direct_http_fallback_when_firecrawl_unconfigured(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        class UnavailableProvider:
+            name = "firecrawl"
+            display_name = "Firecrawl"
+
+            def is_available(self):
+                return False
+
+            def supports_extract(self):
+                return True
+
+        class FakeResponse:
+            headers = {"content-type": "text/html; charset=utf-8"}
+            content = b""
+            url = "https://docs.example/page"
+            text = "<html><head><title>Docs Title</title></head><body><h1>Docs Heading</h1><p>Direct HTTP body.</p><script>ignore()</script></body></html>"
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, url):
+                assert url == "https://docs.example/page"
+                return FakeResponse()
+
+        with patch("tools.web_tools._ensure_web_plugins_loaded"), \
+             patch("tools.web_tools._get_extract_backend", return_value="firecrawl"), \
+             patch("tools.web_tools.async_is_safe_url", new=_AsyncTrue()), \
+             patch("agent.web_search_registry.get_provider", return_value=UnavailableProvider()), \
+             patch("agent.web_search_registry.get_active_extract_provider", return_value=None), \
+             patch("tools.web_tools.httpx.AsyncClient", FakeClient):
+            result = json.loads(asyncio.new_event_loop().run_until_complete(
+                wt.web_extract_tool(["https://docs.example/page"], char_limit=5000)
+            ))
+
+        assert result["results"][0]["title"] == "Docs Title"
+        assert "Docs Heading" in result["results"][0]["content"]
+        assert "Direct HTTP body." in result["results"][0]["content"]
+        assert "ignore()" not in result["results"][0]["content"]
+
 
 def _make_awaitable(value):
     async def _coro(*a, **k):

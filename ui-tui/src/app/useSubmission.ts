@@ -16,6 +16,17 @@ import { PASTE_SNIPPET_RE } from '../protocol/paste.js'
 import type { Msg } from '../types.js'
 
 import type { ComposerActions, ComposerRefs, ComposerState, PasteSnippet } from './interfaces.js'
+import {
+  appendManagedAck,
+  managedAgentName,
+  managedEventPrompt,
+  managedLifecyclePrompt,
+  managedProtocolEnabled,
+  managedSessionDir,
+  pendingManagedInboxItems,
+  pendingManagedLifecycleItems,
+  writeManagedStatus
+} from './managedInbox.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
@@ -23,6 +34,27 @@ const DOUBLE_ENTER_MS = 450
 const SESSION_BUSY_RE = /session busy|waiting for model response/i
 
 const isSessionBusyError = (e: unknown) => e instanceof Error && SESSION_BUSY_RE.test(e.message)
+
+export type ManagedAckContext = {
+  dir: string
+  inboxId: string
+  trigger: string
+}
+
+export type ManagedSubmitOutcome = 'accepted' | 'session_busy' | 'missing_session' | 'error'
+
+export const managedSubmitAckStatus = (outcome: ManagedSubmitOutcome) => {
+  switch (outcome) {
+    case 'accepted':
+      return 'started'
+    case 'session_busy':
+      return 'queued'
+    case 'missing_session':
+      return 'blocked'
+    case 'error':
+      return 'error'
+  }
+}
 
 const expandSnips = (snips: PasteSnippet[]) => {
   const byLabel = new Map<string, string[]>()
@@ -54,6 +86,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
   const lastEmptyAt = useRef(0)
   const typingIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const managedSeenRef = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     if (typingIdleTimer.current) {
@@ -85,13 +118,21 @@ export function useSubmission(opts: UseSubmissionOptions) {
   }, [composerState.input, composerState.inputBuf])
 
   const send = useCallback(
-    (text: string, showUserMessage = true) => {
+    (text: string, showUserMessage = true, managedAck?: ManagedAckContext) => {
       const expand = expandSnips(composerState.pasteSnips)
+      const writeManagedAck = (status: string) => {
+        if (!managedAck) {
+          return
+        }
+
+        appendManagedAck(managedAck.dir, { trigger: managedAck.trigger, inbox_id: managedAck.inboxId, status })
+      }
 
       const startSubmit = (displayText: string, submitText: string, showUserMessage = true) => {
         const sid = getUiState().sid
 
         if (!sid) {
+          writeManagedAck(managedSubmitAckStatus('missing_session'))
           return sys('session not ready yet')
         }
 
@@ -106,23 +147,29 @@ export function useSubmission(opts: UseSubmissionOptions) {
         patchUiState({ busy: true, status: 'running…' })
         turnController.bufRef = ''
         turnController.interrupted = false
+        writeManagedAck('submitted')
 
-        gw.request<PromptSubmitResponse>('prompt.submit', { session_id: sid, text: submitText }).catch((e: Error) => {
-          if (isSessionBusyError(e)) {
-            composerActions.enqueue(submitText)
-            patchUiState({ busy: true, status: 'queued for next turn' })
+        gw.request<PromptSubmitResponse>('prompt.submit', { session_id: sid, text: submitText })
+          .then(() => writeManagedAck(managedSubmitAckStatus('accepted')))
+          .catch((e: Error) => {
+            if (isSessionBusyError(e)) {
+              composerActions.enqueue(submitText)
+              patchUiState({ busy: true, status: 'queued for next turn' })
+              writeManagedAck(managedSubmitAckStatus('session_busy'))
 
-            return sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
-          }
+              return sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
+            }
 
-          sys(`error: ${e.message}`)
-          patchUiState({ busy: false, status: 'ready' })
-        })
+            sys(`error: ${e.message}`)
+            patchUiState({ busy: false, status: 'ready' })
+            writeManagedAck(managedSubmitAckStatus('error'))
+          })
       }
 
       const sid = getUiState().sid
 
       if (!sid) {
+        writeManagedAck(managedSubmitAckStatus('missing_session'))
         return sys('session not ready yet')
       }
 
@@ -147,6 +194,62 @@ export function useSubmission(opts: UseSubmissionOptions) {
     },
     [appendMessage, composerActions, composerState.pasteSnips, gw, maybeGoodVibes, setLastUserMsg, sys]
   )
+
+  useEffect(() => {
+    if (!managedProtocolEnabled()) {
+      return
+    }
+
+    const dir = managedSessionDir()
+
+    const pollManagedInbox = () => {
+      const live = getUiState()
+      writeManagedStatus(dir, {
+        agent: managedAgentName(),
+        busy: live.busy,
+        queue_depth: composerRefs.queueRef.current.length,
+        session_id: live.sid || null,
+        state: live.busy ? 'busy' : 'ready',
+        status: live.status || ''
+      })
+
+      if (!live.sid) {
+        return
+      }
+
+      if (!live.busy && live.status !== 'resuming…' && live.status !== 'resuming...') {
+        const lifecycleItem = pendingManagedLifecycleItems(dir, managedSeenRef.current)[0]
+
+        if (lifecycleItem?.id && lifecycleItem.kind) {
+          managedSeenRef.current.add(lifecycleItem.id)
+          appendManagedAck(dir, { trigger: lifecycleItem.kind, inbox_id: lifecycleItem.id, status: 'received' })
+          sys(`AI-Swarm ${lifecycleItem.kind}: managed inbox item loaded`)
+          send(managedLifecyclePrompt(lifecycleItem.kind, lifecycleItem), false, {
+            dir,
+            inboxId: lifecycleItem.id,
+            trigger: lifecycleItem.kind
+          })
+
+          return
+        }
+      }
+
+      for (const item of pendingManagedInboxItems(dir, managedSeenRef.current)) {
+        if (!item.id || !item.kind) {
+          continue
+        }
+
+        managedSeenRef.current.add(item.id)
+        appendManagedAck(dir, { trigger: item.kind, inbox_id: item.id, status: 'received' })
+        send(managedEventPrompt(item), false, { dir, inboxId: item.id, trigger: item.kind })
+      }
+    }
+
+    pollManagedInbox()
+    const timer = setInterval(pollManagedInbox, 1000)
+
+    return () => clearInterval(timer)
+  }, [composerRefs.queueRef, send])
 
   const shellExec = useCallback(
     (cmd: string) => {

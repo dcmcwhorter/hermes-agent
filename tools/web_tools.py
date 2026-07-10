@@ -946,16 +946,15 @@ async def web_extract_tool(
         return tool_error(error_msg)
 
 
-# Convenience function to check Firecrawl credentials
+# Convenience function to check web-tool availability
 def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available."""
-    configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai"}:
-        return _is_backend_available(configured)
-    return any(
-        _is_backend_available(backend)
-        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai")
-    )
+    """Check whether web tools can do useful work.
+
+    Search still needs a configured search backend, but web_extract now has a
+    direct-HTTP fallback for public pages. Returning True keeps the web toolset
+    visible even when Firecrawl/Tavily/Exa/Parallel are not configured.
+    """
+    return True
 
 
 if __name__ == "__main__":
