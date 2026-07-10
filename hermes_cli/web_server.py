@@ -13962,8 +13962,6 @@ def _maybe_open_browser(
     if not open_browser:
         return
 
-    import webbrowser
-
     _has_display = (
         sys.platform != "linux"
         or bool(os.environ.get("DISPLAY"))
@@ -13985,11 +13983,39 @@ def _maybe_open_browser(
     def _open():
         try:
             time.sleep(1.0)
+            if sys.platform == "darwin":
+                # Python's macOS webbrowser backend probes AppleScript browser
+                # names such as "chrome" and "firefox" and can print noisy
+                # osascript failures, especially when the dashboard was started
+                # with sudo.  LaunchServices' `open -u` is quieter and lets us
+                # target the original login user when sudo is involved.
+                cmd = ["/usr/bin/open", "-u", _open_url]
+                sudo_user = os.environ.get("SUDO_USER")
+                if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+                    cmd = ["/usr/bin/sudo", "-u", sudo_user, *cmd]
+                subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+
+            import webbrowser
+
             webbrowser.open(_open_url)
         except Exception:
-            pass
+            _log.debug("Failed to auto-open dashboard browser", exc_info=True)
 
     threading.Thread(target=_open, daemon=True).start()
+
+
+def _run_dashboard_until_interrupt(run_call):
+    """Run dashboard server code, treating Ctrl-C as a normal stop."""
+    try:
+        run_call()
+    except KeyboardInterrupt:
+        return
 
 
 def start_server(
@@ -14216,7 +14242,7 @@ def start_server(
     # no TCP handshake completing (#50641). So *only on Windows* we mirror
     # uvicorn's own machinery and run on the loop factory it picks.
     if sys.platform != "win32":
-        asyncio.run(_serve())
+        _run_dashboard_until_interrupt(lambda: asyncio.run(_serve()))
         return
 
     # Windows-only path. Resolve the runner + loop factory FIRST (and fall back
@@ -14239,6 +14265,8 @@ def start_server(
             pass
 
     if _runner is not None:
-        _runner(_serve(), loop_factory=_loop_factory)
+        _run_dashboard_until_interrupt(
+            lambda: _runner(_serve(), loop_factory=_loop_factory)
+        )
     else:
-        asyncio.run(_serve())
+        _run_dashboard_until_interrupt(lambda: asyncio.run(_serve()))
