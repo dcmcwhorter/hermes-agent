@@ -13962,8 +13962,6 @@ def _maybe_open_browser(
     if not open_browser:
         return
 
-    import webbrowser
-
     _has_display = (
         sys.platform != "linux"
         or bool(os.environ.get("DISPLAY"))
@@ -13985,9 +13983,29 @@ def _maybe_open_browser(
     def _open():
         try:
             time.sleep(1.0)
+            if sys.platform == "darwin":
+                # Python's macOS webbrowser backend probes AppleScript browser
+                # names such as "chrome" and "firefox" and can print noisy
+                # osascript failures, especially when the dashboard was started
+                # with sudo.  LaunchServices' `open -u` is quieter and lets us
+                # target the original login user when sudo is involved.
+                cmd = ["/usr/bin/open", "-u", _open_url]
+                sudo_user = os.environ.get("SUDO_USER")
+                if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+                    cmd = ["/usr/bin/sudo", "-u", sudo_user, *cmd]
+                subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+
+            import webbrowser
+
             webbrowser.open(_open_url)
         except Exception:
-            pass
+            _log.debug("Failed to auto-open dashboard browser", exc_info=True)
 
     threading.Thread(target=_open, daemon=True).start()
 
