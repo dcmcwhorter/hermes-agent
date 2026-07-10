@@ -275,15 +275,66 @@ class TestSchemas:
         assert REFLECT_SCHEMA["name"] == "hindsight_reflect"
         assert "query" in REFLECT_SCHEMA["parameters"]["properties"]
 
-    def test_get_tool_schemas_returns_three(self, provider):
+    def test_get_tool_schemas_returns_memory_tools(self, provider):
         schemas = provider.get_tool_schemas()
-        assert len(schemas) == 3
         names = {s["name"] for s in schemas}
-        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
+        assert {
+            "hindsight_retain",
+            "hindsight_recall",
+            "hindsight_reflect",
+            "hindsight_memory_search",
+            "hindsight_memory_list",
+            "hindsight_memory_get",
+            "hindsight_memory_history",
+            "hindsight_memory_update",
+            "hindsight_memory_invalidate",
+            "hindsight_memory_restore",
+        }.issubset(names)
 
     def test_context_mode_returns_no_tools(self, provider_with_config):
         p = provider_with_config(memory_mode="context")
         assert p.get_tool_schemas() == []
+
+    def test_memory_curation_tools_call_memory_api(self, provider, monkeypatch):
+        calls = []
+
+        def fake_request(method, path, *, body=None, query=None):
+            calls.append((method, path, body, query))
+            return {"ok": True, "path": path}
+
+        monkeypatch.setattr(provider, "_memory_api_request", fake_request)
+
+        assert json.loads(provider.handle_tool_call("hindsight_memory_list", {"state": "invalidated"}))["result"]["ok"] is True
+        assert calls[-1] == (
+            "GET",
+            "memories/list",
+            None,
+            {"state": "invalidated", "fact_type": None, "limit": None, "offset": None},
+        )
+
+        assert json.loads(provider.handle_tool_call("hindsight_memory_get", {"memory_id": "mem 1"}))["result"]["path"] == "memories/mem%201"
+        assert json.loads(
+            provider.handle_tool_call(
+                "hindsight_memory_update",
+                {"memory_id": "mem1", "text": "corrected", "reason": "wrong subject"},
+            )
+        )["result"]["ok"] is True
+        assert calls[-1] == (
+            "PATCH",
+            "memories/mem1",
+            {"text": "corrected", "reason": "wrong subject"},
+            None,
+        )
+
+        provider.handle_tool_call("hindsight_memory_invalidate", {"memory_id": "mem1", "reason": "duplicate"})
+        assert calls[-1] == (
+            "PATCH",
+            "memories/mem1",
+            {"state": "invalidated", "reason": "duplicate"},
+            None,
+        )
+        provider.handle_tool_call("hindsight_memory_restore", {"memory_id": "mem1"})
+        assert calls[-1] == ("PATCH", "memories/mem1", {"state": "valid"}, None)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +343,27 @@ class TestSchemas:
 
 
 class TestConfig:
+    def test_load_config_prefers_agent_home_hindsight_config(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        profile = tmp_path / "profile"
+        (home / ".hindsight").mkdir(parents=True)
+        (profile / "hindsight").mkdir(parents=True)
+        (home / ".hindsight" / "config.json").write_text(
+            json.dumps({"mode": "local_external", "api_url": "http://localhost:8888", "bank_id": "home-bank"}),
+            encoding="utf-8",
+        )
+        (profile / "hindsight" / "config.json").write_text(
+            json.dumps({"mode": "local_external", "api_url": "http://localhost:9999", "bank_id": "profile-bank"}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: profile)
+
+        cfg = _load_config()
+
+        assert cfg["api_url"] == "http://localhost:8888"
+        assert cfg["bank_id"] == "home-bank"
+
     def test_cloud_client_lazy_installs_dependency_before_import(self, tmp_path, monkeypatch):
         _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, "cloud")
 

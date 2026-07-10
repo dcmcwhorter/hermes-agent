@@ -39,6 +39,9 @@ import os
 import queue
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -341,34 +344,180 @@ REFLECT_SCHEMA = {
     },
 }
 
+MEMORY_SEARCH_SCHEMA = {
+    "name": "hindsight_memory_search",
+    "description": (
+        "Search Hindsight memories and return structured result text. This is an "
+        "alias for recall with optional budget, max_tokens, tags, and fact types."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query."},
+            "budget": {"type": "string", "enum": ["low", "mid", "high"], "description": "Optional recall budget."},
+            "max_tokens": {"type": "integer", "description": "Optional maximum tokens to return."},
+            "types": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["world", "experience", "observation"]},
+                "description": "Optional fact types to include.",
+            },
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "tags_match": {"type": "string", "description": "Tag match mode, e.g. any or all."},
+        },
+        "required": ["query"],
+    },
+}
+
+MEMORY_LIST_SCHEMA = {
+    "name": "hindsight_memory_list",
+    "description": "List Hindsight memory units in the active bank, including invalidated rows by default.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "state": {"type": "string", "enum": ["valid", "invalidated"], "description": "Optional state filter."},
+            "fact_type": {"type": "string", "enum": ["world", "experience", "observation"], "description": "Optional fact type filter."},
+            "limit": {"type": "integer", "description": "Optional result limit."},
+            "offset": {"type": "integer", "description": "Optional pagination offset."},
+        },
+    },
+}
+
+MEMORY_GET_SCHEMA = {
+    "name": "hindsight_memory_get",
+    "description": "Fetch one Hindsight memory unit by ID, including metadata and curation state.",
+    "parameters": {
+        "type": "object",
+        "properties": {"memory_id": {"type": "string", "description": "Memory unit ID."}},
+        "required": ["memory_id"],
+    },
+}
+
+MEMORY_HISTORY_SCHEMA = {
+    "name": "hindsight_memory_history",
+    "description": "Fetch the edit/refresh history for a Hindsight memory unit.",
+    "parameters": {
+        "type": "object",
+        "properties": {"memory_id": {"type": "string", "description": "Memory unit ID."}},
+        "required": ["memory_id"],
+    },
+}
+
+MEMORY_UPDATE_SCHEMA = {
+    "name": "hindsight_memory_update",
+    "description": (
+        "Curate a raw Hindsight memory unit by editing text/context/dates/fact_type/entities. "
+        "Empty strings clear nullable fields; omitted fields are unchanged."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string"},
+            "text": {"type": "string"},
+            "context": {"type": "string"},
+            "occurred_start": {"type": "string"},
+            "occurred_end": {"type": "string"},
+            "fact_type": {"type": "string", "enum": ["world", "experience"]},
+            "entities": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string", "description": "Audit reason for the edit."},
+        },
+        "required": ["memory_id"],
+    },
+}
+
+MEMORY_INVALIDATE_SCHEMA = {
+    "name": "hindsight_memory_invalidate",
+    "description": "Soft-retire a Hindsight memory unit so it leaves recall/consolidation but remains auditable.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string"},
+            "reason": {"type": "string", "description": "Audit reason for invalidation."},
+        },
+        "required": ["memory_id"],
+    },
+}
+
+MEMORY_RESTORE_SCHEMA = {
+    "name": "hindsight_memory_restore",
+    "description": "Restore a previously invalidated Hindsight memory unit to the active set.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string"},
+            "reason": {"type": "string", "description": "Optional audit reason."},
+        },
+        "required": ["memory_id"],
+    },
+}
+
+_MEMORY_TOOL_SCHEMAS = [
+    RETAIN_SCHEMA,
+    RECALL_SCHEMA,
+    REFLECT_SCHEMA,
+    MEMORY_SEARCH_SCHEMA,
+    MEMORY_LIST_SCHEMA,
+    MEMORY_GET_SCHEMA,
+    MEMORY_HISTORY_SCHEMA,
+    MEMORY_UPDATE_SCHEMA,
+    MEMORY_INVALIDATE_SCHEMA,
+    MEMORY_RESTORE_SCHEMA,
+]
+
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    """Load config from profile-scoped path, legacy path, or env vars.
+    """Load Hindsight config from the agent home, profile fallback, or env vars.
 
     Resolution order:
-      1. $HERMES_HOME/hindsight/config.json  (profile-scoped)
-      2. ~/.hindsight/config.json             (legacy, shared)
+      1. <agent-home>/.hindsight/config.json  (AI-Swarm per-agent config)
+      2. $HERMES_HOME/hindsight/config.json   (profile-scoped fallback)
       3. Environment variables
+
+    In a normal Hermes install, ``HERMES_HOME`` is ``<agent-home>/.hermes`` so
+    the agent-home path is unambiguous. Tests and unusual profiles often point
+    ``get_hermes_home()`` at a temporary directory; in those cases we must not
+    accidentally read the real user's ``~/.hindsight`` and contaminate the test
+    with Porto's live daemon/bank config.
     """
     from pathlib import Path
+    import pwd
 
-    # Profile-scoped path (preferred)
-    profile_path = get_hermes_home() / "hindsight" / "config.json"
-    if profile_path.exists():
+    hermes_home = get_hermes_home()
+    profile_path = hermes_home / "hindsight" / "config.json"
+    paths: list[Path] = []
+
+    # Normal install: /Users/agent/.hermes -> /Users/agent/.hindsight.
+    if hermes_home.name == ".hermes":
+        paths.append(hermes_home.parent / ".hindsight" / "config.json")
+    else:
+        # If HOME was intentionally overridden (e.g. tests or launched under a
+        # specific agent home), honor it as the agent-home config source.
         try:
-            return json.loads(profile_path.read_text(encoding="utf-8"))
+            real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).expanduser().resolve()
         except Exception:
-            pass
-
-    # Legacy shared path (backward compat)
-    legacy_path = Path.home() / ".hindsight" / "config.json"
-    if legacy_path.exists():
+            real_home = None
+        env_home = Path.home().expanduser()
         try:
-            return json.loads(legacy_path.read_text(encoding="utf-8"))
+            env_home_resolved = env_home.resolve()
+        except Exception:
+            env_home_resolved = env_home
+        if real_home is None or env_home_resolved != real_home:
+            paths.append(env_home / ".hindsight" / "config.json")
+
+    paths.append(profile_path)
+
+    seen: set[Path] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        if not path.exists():
+            continue
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             pass
 
@@ -1165,6 +1314,148 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = client
             return self._run_sync(operation(client))
 
+    def _memory_api_base_url(self) -> str:
+        """Return the base URL for direct Hindsight memory-curation endpoints."""
+        if self._mode == "local_embedded":
+            client = self._get_client()
+            ensure_started = getattr(client, "_ensure_started", None)
+            if callable(ensure_started):
+                ensure_started()
+            url = getattr(client, "url", None)
+            if url:
+                return str(url).rstrip("/")
+        return (self._api_url or "").rstrip("/")
+
+    def _memory_api_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> Any:
+        """Call Hindsight's documented memory-unit REST API.
+
+        The Python client versions Hermes can encounter do not all expose the
+        newer memory curation endpoints, so provider tools use the stable REST
+        surface documented by Hindsight: /v1/default/banks/{bank}/memories/...
+        """
+        base_url = self._memory_api_base_url()
+        if not base_url:
+            raise RuntimeError("Hindsight API URL is not configured")
+        bank = urllib.parse.quote(self._bank_id, safe="")
+        rel = path.lstrip("/")
+        url = f"{base_url}/v1/default/banks/{bank}/{rel}"
+        params = {
+            key: value
+            for key, value in (query or {}).items()
+            if value is not None and value != ""
+        }
+        if params:
+            url += "?" + urllib.parse.urlencode(params, doseq=True)
+        payload = None
+        headers = {"Accept": "application/json"}
+        if body is not None:
+            payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        req = urllib.request.Request(url, data=payload, headers=headers, method=method.upper())
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:  # noqa: S310
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"Hindsight memory API {method} {path} failed: HTTP {exc.code}: {detail}") from exc
+        if not raw.strip():
+            return {"ok": True}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"text": raw}
+
+    @staticmethod
+    def _require_memory_id(args: dict) -> str:
+        memory_id = str(args.get("memory_id") or "").strip()
+        if not memory_id:
+            raise ValueError("Missing required parameter: memory_id")
+        return urllib.parse.quote(memory_id, safe="")
+
+    def _handle_memory_search(self, args: dict) -> str:
+        query = args.get("query", "")
+        if not query:
+            return tool_error("Missing required parameter: query")
+        try:
+            recall_kwargs: dict = {
+                "bank_id": self._bank_id,
+                "query": query,
+                "budget": args.get("budget") or self._budget,
+                "max_tokens": args.get("max_tokens") or self._recall_max_tokens,
+            }
+            if args.get("tags"):
+                recall_kwargs["tags"] = args.get("tags")
+                recall_kwargs["tags_match"] = args.get("tags_match") or self._recall_tags_match
+            elif self._recall_tags:
+                recall_kwargs["tags"] = self._recall_tags
+                recall_kwargs["tags_match"] = self._recall_tags_match
+            if args.get("types"):
+                recall_kwargs["types"] = args.get("types")
+            elif self._recall_types:
+                recall_kwargs["types"] = self._recall_types
+            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+            rows = [getattr(r, "text", "") for r in (resp.results or []) if getattr(r, "text", "")]
+            return json.dumps({"result": "\n".join(rows) if rows else "No relevant memories found.", "count": len(rows)})
+        except Exception as e:
+            logger.warning("hindsight_memory_search failed: %s", e, exc_info=True)
+            return tool_error(f"Failed to search memory: {e}")
+
+    def _handle_memory_api_tool(self, tool_name: str, args: dict) -> str:
+        try:
+            if tool_name == "hindsight_memory_list":
+                result = self._memory_api_request(
+                    "GET",
+                    "memories/list",
+                    query={
+                        "state": args.get("state"),
+                        "fact_type": args.get("fact_type"),
+                        "limit": args.get("limit"),
+                        "offset": args.get("offset"),
+                    },
+                )
+            elif tool_name == "hindsight_memory_get":
+                memory_id = self._require_memory_id(args)
+                result = self._memory_api_request("GET", f"memories/{memory_id}")
+            elif tool_name == "hindsight_memory_history":
+                memory_id = self._require_memory_id(args)
+                result = self._memory_api_request("GET", f"memories/{memory_id}/history")
+            elif tool_name == "hindsight_memory_update":
+                memory_id = self._require_memory_id(args)
+                allowed = ("text", "context", "occurred_start", "occurred_end", "fact_type", "entities", "reason")
+                body = {key: args[key] for key in allowed if key in args}
+                if not body:
+                    return tool_error("Provide at least one field to update.")
+                result = self._memory_api_request("PATCH", f"memories/{memory_id}", body=body)
+            elif tool_name == "hindsight_memory_invalidate":
+                memory_id = self._require_memory_id(args)
+                body = {"state": "invalidated"}
+                if args.get("reason"):
+                    body["reason"] = args["reason"]
+                result = self._memory_api_request("PATCH", f"memories/{memory_id}", body=body)
+            elif tool_name == "hindsight_memory_restore":
+                memory_id = self._require_memory_id(args)
+                body = {"state": "valid"}
+                if args.get("reason"):
+                    body["reason"] = args["reason"]
+                result = self._memory_api_request("PATCH", f"memories/{memory_id}", body=body)
+            else:
+                return tool_error(f"Unknown tool: {tool_name}")
+            return json.dumps({"result": result}, ensure_ascii=False, default=str)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        except Exception as exc:
+            logger.warning("%s failed: %s", tool_name, exc, exc_info=True)
+            return tool_error(f"Hindsight memory API error: {exc}")
+
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
 
@@ -1452,15 +1743,17 @@ class HindsightMemoryProvider(MemoryProvider):
             return (
                 f"# Hindsight Memory\n"
                 f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
-                f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-                f"hindsight_retain to store facts."
+                f"Use hindsight_recall/hindsight_memory_search to search, "
+                f"hindsight_reflect for synthesis, hindsight_retain to store facts, "
+                f"and hindsight_memory_list/get/update/invalidate/restore to curate memory."
             )
         return (
             f"# Hindsight Memory\n"
             f"Active. Bank: {self._bank_id}, budget: {self._budget}.\n"
             f"Relevant memories are automatically injected into context. "
-            f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-            f"hindsight_retain to store facts."
+            f"Use hindsight_recall/hindsight_memory_search to search, "
+            f"hindsight_reflect for synthesis, hindsight_retain to store facts, "
+            f"and hindsight_memory_list/get/update/invalidate/restore to curate memory."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -1698,9 +1991,20 @@ class HindsightMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
-        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return list(_MEMORY_TOOL_SCHEMAS)
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        if tool_name == "hindsight_memory_search":
+            return self._handle_memory_search(args)
+        if tool_name in {
+            "hindsight_memory_list",
+            "hindsight_memory_get",
+            "hindsight_memory_history",
+            "hindsight_memory_update",
+            "hindsight_memory_invalidate",
+            "hindsight_memory_restore",
+        }:
+            return self._handle_memory_api_tool(tool_name, args)
         if tool_name == "hindsight_retain":
             content = args.get("content", "")
             if not content:
