@@ -343,12 +343,12 @@ class TestBackendSelection:
              patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
             assert _get_backend() == "firecrawl"
 
-    def test_fallback_no_keys_defaults_to_firecrawl(self):
-        """No keys, no config → 'firecrawl' (will fail at client init)."""
+    def test_fallback_no_keys_defaults_to_ddgs(self):
+        """No keys, no config → 'ddgs', not Firecrawl."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch("tools.web_tools._ddgs_package_importable", return_value=False):
-            assert _get_backend() == "firecrawl"
+            assert _get_backend() == "ddgs"
 
     def test_invalid_config_falls_through_to_fallback(self):
         """web.backend=invalid → ignored, uses key-based fallback."""
@@ -369,14 +369,17 @@ class TestBackendSelection:
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}):
             assert _get_backend() == "tavily"
 
-    def test_managed_gateway_only_falls_through_to_firecrawl(self):
-        """When no explicit-credential backend is configured, a Nous-managed
-        gateway token still selects firecrawl — the convenience path is
-        preserved, just no longer pre-empts."""
+    def test_managed_gateway_only_falls_through_to_ddgs(self):
+        """A Nous-managed Firecrawl gateway must not become the default web path.
+
+        Feature 10 prefers direct HTTP/browser/search providers unless the user
+        explicitly configures Firecrawl credentials or backend.
+        """
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={}), \
-             patch("tools.web_tools._is_tool_gateway_ready", return_value=True):
-            assert _get_backend() == "firecrawl"
+             patch("tools.web_tools._is_tool_gateway_ready", return_value=True), \
+             patch("tools.web_tools._ddgs_package_importable", return_value=False):
+            assert _get_backend() == "ddgs"
 
 
 class TestParallelClientConfig:

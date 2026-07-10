@@ -158,8 +158,9 @@ def _get_backend() -> str:
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
         ("parallel", _has_env("PARALLEL_API_KEY")),
+        # Firecrawl is no longer a managed/default path. Use it only when
+        # explicitly configured with direct/self-hosted credentials.
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
-        ("firecrawl", _is_tool_gateway_ready()),
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
@@ -168,7 +169,7 @@ def _get_backend() -> str:
         if available:
             return backend
 
-    return "firecrawl"  # default (backward compat)
+    return "ddgs"  # safe no-key default; Firecrawl requires explicit config
 
 
 def _get_search_backend() -> str:
@@ -463,6 +464,102 @@ def _truncate_with_footer(
     return model_text, True
 
 
+class _ReadableHTMLParser:
+    """Small dependency-free HTML-to-text fallback for direct HTTP extract."""
+
+    def __init__(self) -> None:
+        from html.parser import HTMLParser
+
+        class Parser(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__(convert_charrefs=True)
+                self.title_parts: list[str] = []
+                self.parts: list[str] = []
+                self._skip_depth = 0
+                self._in_title = False
+
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                tag = tag.lower()
+                if tag in {"script", "style", "noscript", "svg"}:
+                    self._skip_depth += 1
+                    return
+                if tag == "title":
+                    self._in_title = True
+                if tag in {"p", "div", "section", "article", "header", "footer", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "pre"}:
+                    self.parts.append("\n")
+
+            def handle_endtag(self, tag: str) -> None:
+                tag = tag.lower()
+                if tag in {"script", "style", "noscript", "svg"} and self._skip_depth:
+                    self._skip_depth -= 1
+                    return
+                if tag == "title":
+                    self._in_title = False
+                if tag in {"p", "div", "section", "article", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "pre"}:
+                    self.parts.append("\n")
+
+            def handle_data(self, data: str) -> None:
+                if self._skip_depth:
+                    return
+                text = data.strip()
+                if not text:
+                    return
+                if self._in_title:
+                    self.title_parts.append(text)
+                self.parts.append(text + " ")
+
+        self.parser = Parser()
+
+    def feed(self, html: str) -> tuple[str, str]:
+        self.parser.feed(html)
+        title = " ".join(self.parser.title_parts).strip()
+        text = "".join(self.parser.parts)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+        return title, text.strip()
+
+
+async def _direct_http_extract_urls(urls: List[str]) -> List[Dict[str, Any]]:
+    """Best-effort direct HTTP fallback when no extract backend is configured.
+
+    This is intentionally small and deterministic: no Firecrawl, no LLM, no
+    browser. It covers public documentation and simple HTML/text/PDF URLs so a
+    missing paid extract backend does not make the agent claim docs are
+    inaccessible. Browser/Camofox remains the next fallback for JS-heavy pages.
+    """
+    results: List[Dict[str, Any]] = []
+    headers = {
+        "User-Agent": "HermesAgent/feature10-direct-http (+https://hermes-agent.nousresearch.com)",
+        "Accept": "text/html,application/xhtml+xml,text/plain,application/pdf;q=0.8,*/*;q=0.5",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20.0, headers=headers) as client:
+        for url in urls:
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                ctype = (resp.headers.get("content-type") or "").lower()
+                if "application/pdf" in ctype or url.lower().endswith(".pdf"):
+                    content = f"[PDF fetched by direct HTTP: {len(resp.content):,} bytes. Use browser/PDF tooling for text extraction if needed.]"
+                    title = url.rsplit("/", 1)[-1] or url
+                else:
+                    body = resp.text
+                    if "html" in ctype or "<html" in body[:500].lower():
+                        title, content = _ReadableHTMLParser().feed(body)
+                    else:
+                        title, content = "", body.strip()
+                    if not title:
+                        title = url
+                results.append({
+                    "url": str(resp.url),
+                    "title": title,
+                    "content": content,
+                    "raw_content": content,
+                    "metadata": {"backend": "direct-http", "content_type": ctype},
+                })
+            except Exception as exc:  # noqa: BLE001
+                results.append({"url": url, "title": "", "content": "", "error": f"direct HTTP extract failed: {exc}"})
+    return results
+
 
 # ─── Exa / Parallel inline helpers — moved into plugins ──────────────────────
 # After PR #25182, the exa client + search/extract and parallel client +
@@ -711,55 +808,56 @@ async def web_extract_tool(
             )
 
             provider = _wsp_get_provider(backend) if backend else None
-            if provider is None or not provider.supports_extract():
-                # When the configured name IS registered but doesn't support
-                # extract (search-only providers like brave-free / ddgs /
-                # searxng), surface that as a typed "search-only" error
-                # rather than silently switching backends. When the name
-                # isn't registered at all (typo / uninstalled plugin), fall
-                # through to the active-provider walk.
-                if provider is not None and not provider.supports_extract():
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "error": (
-                                f"{provider.display_name} is a search-only "
-                                "backend and cannot extract URL content. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
-                            ),
-                        },
-                        ensure_ascii=False,
-                    )
-                provider = get_active_extract_provider()
-                if provider is None:
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "error": (
-                                "No web extract provider configured. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
-                            ),
-                        },
-                        ensure_ascii=False,
-                    )
-
-            logger.info(
-                "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
-            )
-
-            # Async-or-sync dispatch: parallel + firecrawl have async
-            # extract(); exa + tavily are sync.
-            import inspect
-            if inspect.iscoroutinefunction(provider.extract):
-                results = await provider.extract(safe_urls, format=format)
-            else:
-                # Run sync extract() in a thread so we don't block the
-                # event loop on network I/O.
-                results = await asyncio.to_thread(
-                    provider.extract, safe_urls, format=format
+            if provider is not None and hasattr(provider, "is_available") and not provider.is_available():
+                logger.info(
+                    "Configured web extract backend %s is unavailable; trying fallback",
+                    provider.name,
                 )
+                provider = None
+            if provider is None or not provider.supports_extract():
+                # Search-only configured backends (ddgs/brave/searxng) now
+                # fall back to direct HTTP extraction instead of telling the
+                # agent to configure Firecrawl.
+                if provider is not None and not provider.supports_extract():
+                    logger.info(
+                        "Configured extract backend %s is search-only; using direct HTTP fallback",
+                        provider.name,
+                    )
+                    results = await _direct_http_extract_urls(safe_urls)
+                else:
+                    provider = get_active_extract_provider()
+                    if provider is not None and hasattr(provider, "is_available") and not provider.is_available():
+                        provider = None
+                    if provider is None:
+                        logger.info("No configured extract backend available; using direct HTTP fallback")
+                        results = await _direct_http_extract_urls(safe_urls)
+                    else:
+                        logger.info(
+                            "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
+                        )
+                        import inspect
+                        if inspect.iscoroutinefunction(provider.extract):
+                            results = await provider.extract(safe_urls, format=format)
+                        else:
+                            results = await asyncio.to_thread(
+                                provider.extract, safe_urls, format=format
+                            )
+            else:
+                logger.info(
+                    "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
+                )
+
+                # Async-or-sync dispatch: parallel + firecrawl have async
+                # extract(); exa + tavily are sync.
+                import inspect
+                if inspect.iscoroutinefunction(provider.extract):
+                    results = await provider.extract(safe_urls, format=format)
+                else:
+                    # Run sync extract() in a thread so we don't block the
+                    # event loop on network I/O.
+                    results = await asyncio.to_thread(
+                        provider.extract, safe_urls, format=format
+                    )
 
         # Merge any SSRF-blocked results back in
         if ssrf_blocked:
