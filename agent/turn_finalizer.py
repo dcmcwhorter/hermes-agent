@@ -238,6 +238,15 @@ def finalize_turn(
         if callable(_apply_override):
             _apply_override(messages)
         agent._persist_session(messages, conversation_history)
+
+        # Keep pluggable context engines fresh on ordinary turns. LCM used to
+        # ingest only during compaction/tool calls/session end, which meant a
+        # healthy engine could have a stale DB for low-pressure sessions. This
+        # hook is deliberately fail-soft so context-engine storage cannot lose
+        # the user's final response or block normal session persistence.
+        _ingest_messages = getattr(getattr(agent, "context_compressor", None), "ingest_messages", None)
+        if callable(_ingest_messages):
+            _ingest_messages(messages)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
