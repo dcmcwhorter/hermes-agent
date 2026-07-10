@@ -1,0 +1,10 @@
+name: autocontext
+version: 1.0.0
+description: "AutoContext control-plane integration: runtime health, queue/evaluation, improve/judge CLI bridge, REST artifact access, and MCP surface discovery."
+author: AI-Swarm
+kind: backend
+provides_tools:
+  - autocontext_status
+  - autocontext_evaluate_output
+  - autocontext_improve_output
+  - autocontext_artifact
