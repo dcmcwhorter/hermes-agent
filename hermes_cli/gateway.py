@@ -1233,13 +1233,11 @@ def _recover_pending_systemd_restart(
 
 
 def _parse_launchd_pid_from_list_output(output: str) -> int | None:
-    """Extract the PID from ``launchctl list <label>`` output.
+    """Extract the PID from launchctl list/print output.
 
-    When launchd is actively supervising a process, the output includes a
-    ``"PID" = <number>;`` line.  When the service definition is only *registered*
-    but not running (macOS 26+ with an unmanageable domain, fallback active),
-    the output lacks a PID field entirely.  Returns ``None`` when no PID is
-    found or the PID is non-positive (e.g. ``-1`` for a recently-crashed service).
+    ``launchctl list <label>`` uses ``"PID" = N;`` while
+    ``launchctl print <domain>/<label>`` uses lower-case ``pid = N``.
+    Returns ``None`` when no positive PID is present.
     """
     for line in output.splitlines():
         stripped = line.strip()
@@ -1252,22 +1250,44 @@ def _parse_launchd_pid_from_list_output(output: str) -> int | None:
                     return pid if pid > 0 else None
                 except ValueError:
                     return None
+        if stripped.startswith("pid ="):
+            try:
+                pid = int(stripped.split("=", 1)[1].strip())
+                return pid if pid > 0 else None
+            except ValueError:
+                return None
     return None
 
 
 def _probe_launchd_service_running() -> bool:
     """Return True when launchd is actively supervising the gateway process.
 
-    ``launchctl list <label>`` returns exit 0 whenever the service definition is
-    registered with launchd — even when ``state = not running`` (macOS 26+).
-    We additionally require a PID in the output to confirm launchd is actually
-    managing a live process, not just holding a static definition.
+    Prefer domain-qualified ``launchctl print`` over bare ``launchctl list``:
+    AI-Swarm service users can run under another user's Aqua manager, where a
+    bare list probes the wrong domain even though ``user/<uid>/<label>`` is
+    loaded and running. Fall back to legacy ``list`` only when domain print is
+    unavailable.
     """
     if not get_launchd_plist_path().exists():
         return False
+    label = get_launchd_label()
     try:
         result = subprocess.run(
-            ["launchctl", "list", get_launchd_label()],
+            ["launchctl", "print", f"{_launchd_domain()}/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            if _parse_launchd_pid_from_list_output(result.stdout) is not None:
+                return True
+            # Some tests/older launchd surfaces return success with no PID in
+            # `print`; fall through to legacy `list` before declaring stopped.
+    except subprocess.TimeoutExpired:
+        return False
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", label],
             capture_output=True,
             text=True,
             timeout=10,
@@ -3571,6 +3591,25 @@ def _launchd_domain() -> str:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
+    # If Hermes is invoked under another user's Aqua manager (common for
+    # AI-Swarm service users launched from Dan's desktop session),
+    # ``launchctl managername`` can still report Aqua even though this UID has
+    # no ``gui/<uid>`` domain. In that topology the only plausible domain for
+    # this user's LaunchAgent is ``user/<uid>``.
+    try:
+        result = subprocess.run(
+            ["launchctl", "manageruid"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        manager_uid = int((result.stdout or "").strip())
+        if manager_uid != uid:
+            _resolved_launchd_domain = user_domain
+            return user_domain
+    except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
     # 3. Neither domain has the service loaded — use managername as heuristic.
     #    Aqua → gui/<uid>, anything else (Background, loginwindow) → user/<uid>.
     try:
@@ -3754,6 +3793,27 @@ def _retry_launchctl_bootstrap_until_registered(
         if time.monotonic() >= deadline:
             return False
         time.sleep(2)
+
+
+def _sudo_launchctl_bootstrap_if_possible(domain: str, plist_path: Path) -> bool:
+    """Best-effort recovery for service users with a user launchd domain.
+
+    On macOS 26 AI-Swarm hosts, a non-interactive service user can have a
+    ``user/<uid>`` launchd domain that rejects self-bootstrap with exit 5, while
+    ``sudo -n launchctl bootstrap user/<uid> ...`` succeeds.  Try that narrow
+    escalation before declaring launchd unavailable and falling back detached.
+    """
+    if not domain.startswith("user/"):
+        return False
+    try:
+        subprocess.run(
+            ["sudo", "-n", "launchctl", "bootstrap", domain, str(plist_path)],
+            check=True,
+            timeout=30,
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return False
 
 
 # ── launchd unsupported marker ─────────────────────────────────────────────
@@ -4141,11 +4201,19 @@ def launchd_install(force: bool = False):
     print(f"Installing launchd service to: {plist_path}")
     plist_path.write_text(new_plist)
 
+    domain = _launchd_domain()
     try:
         _launchctl_bootstrap(
-            _launchd_domain(), plist_path, get_launchd_label(), timeout=30
+            domain, plist_path, get_launchd_label(), timeout=30
         )
     except subprocess.CalledProcessError as e:
+        if _launchctl_domain_unsupported(
+            e.returncode
+        ) and _sudo_launchctl_bootstrap_if_possible(domain, plist_path):
+            print()
+            print("✓ Service installed and loaded via launchd user domain!")
+            _clear_launchd_unsupported_marker()
+            return
         if not _launchctl_domain_unsupported(e.returncode):
             raise
         _launchd_fallback_to_detached(f"launchctl bootstrap exit {e.returncode}")
@@ -4396,9 +4464,11 @@ def launchd_restart():
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
     try:
         result = subprocess.run(
-            ["launchctl", "list", label],
+            ["launchctl", "print", target],
             capture_output=True,
             text=True,
             timeout=10,
@@ -4409,11 +4479,25 @@ def launchd_status(deep: bool = False):
         service_listed = False
         list_output = ""
 
-    # Determine whether launchd is actively supervising a process.
-    # ``launchctl list`` returns exit 0 whenever the service definition is
-    # registered — even when ``state = not running`` (macOS 26+ with an
-    # unmanageable domain).  A PID in the output confirms a live process.
+    # Determine whether launchd is actively supervising a process. Prefer the
+    # domain-qualified `print` output, then fall back to legacy `list` if print
+    # succeeded without including a PID.
     launchd_pid = _parse_launchd_pid_from_list_output(list_output) if service_listed else None
+    if service_listed and launchd_pid is None:
+        try:
+            list_result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if list_result.returncode == 0:
+                legacy_pid = _parse_launchd_pid_from_list_output(list_result.stdout)
+                if legacy_pid is not None:
+                    launchd_pid = legacy_pid
+                    list_output = list_result.stdout
+        except subprocess.TimeoutExpired:
+            pass
 
     # Hermes PID tracking — may be a detached fallback process spawned when
     # launchd cannot manage the domain on this host.
@@ -4430,6 +4514,9 @@ def launchd_status(deep: bool = False):
     # exit 5/125 on this host.  Lets us explain *why* launchd can't supervise
     # even when no fallback process is currently running.
     launchd_unsupported = _launchd_unsupported_marker_exists()
+    if launchd_pid is not None and launchd_unsupported:
+        _clear_launchd_unsupported_marker()
+        launchd_unsupported = False
 
     # ── Report ──
     print(f"Launchd plist: {plist_path}")
