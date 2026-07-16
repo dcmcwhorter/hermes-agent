@@ -34,6 +34,10 @@ def git(*args: str) -> str:
 
 def verify(require_active: bool, require_legacy_removed: bool) -> dict:
     errors: list[str] = []
+    legacy_source_present = any(
+        (LEGACY_SOURCE / marker).exists()
+        for marker in (".git", "pyproject.toml", "hermes_cli", "agent")
+    )
     if not (CANONICAL_SOURCE / ".git").exists():
         errors.append("canonical source is not a Git checkout")
     if not (CANONICAL_VENV / "bin" / "hermes").exists():
@@ -60,7 +64,7 @@ def verify(require_active: bool, require_legacy_removed: bool) -> dict:
     expected_target = str(CANONICAL_VENV / "bin" / "hermes")
     if require_active and active_target != expected_target:
         errors.append(f"active binary resolves to {active_target}, expected {expected_target}")
-    if require_legacy_removed and LEGACY_SOURCE.exists():
+    if require_legacy_removed and legacy_source_present:
         errors.append(f"legacy source checkout still exists: {LEGACY_SOURCE}")
 
     profile_markers = {
@@ -84,7 +88,7 @@ def verify(require_active: bool, require_legacy_removed: bool) -> dict:
         "active_binary": str(ACTIVE_BIN),
         "active_target": active_target,
         "legacy_source": str(LEGACY_SOURCE),
-        "legacy_source_present": LEGACY_SOURCE.exists(),
+        "legacy_source_present": legacy_source_present,
         "profile_markers": profile_markers,
         "source_runtime_artifacts": source_runtime_artifacts,
         "errors": errors,
