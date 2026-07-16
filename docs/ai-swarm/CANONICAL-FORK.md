@@ -53,8 +53,8 @@ Existing running Hermes processes are not restarted by source activation. They k
 
 ## Rollback
 
-1. Atomically relink `~/.local/bin/hermes` to the preserved legacy venv console script.
-2. Rename the quarantined legacy checkout back to `~/.hermes/hermes-agent`.
+1. Rename the quarantined legacy checkout back to `~/.hermes/hermes-agent` so its editable venv target exists again.
+2. Atomically relink `~/.local/bin/hermes` to the restored legacy venv console script.
 3. Start a clean shell and verify `hermes version` reports the legacy commit.
 4. If the quarantine was lost, restore the checkout from the Git bundle and reinstall its venv.
 
