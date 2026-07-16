@@ -15,7 +15,7 @@ Source code must not live under a Hermes profile directory. Runtime state must n
 
 ## Reconciled history
 
-The branch starts at Nous upstream `e0240d7bf412a6c6eddf3dad8fd490fb8431d9aa` and carries the nine existing AI-Swarm commits in original order. A tenth commit aligns managed task lookup with the gateway's `assigned_to` schema. Conflict resolution retained current upstream behavior while preserving:
+The branch starts at Nous upstream `e0240d7bf7ce0d665417d45de0bfa9a65cb0ab48` and carries the nine existing AI-Swarm commits in original order. A tenth commit aligns managed task lookup with the gateway's `assigned_to` schema. Conflict resolution retained current upstream behavior while preserving:
 
 - Hindsight curation and embedded runtime support;
 - LCM context ingestion and the AutoContext plugin;

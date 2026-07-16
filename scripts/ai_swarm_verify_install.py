@@ -13,7 +13,7 @@ CANONICAL_SOURCE = Path("/opt/ai-swarm/hermes-agent")
 CANONICAL_VENV = Path.home() / ".hermes" / "venvs" / "hermes-ai-swarm"
 ACTIVE_BIN = Path.home() / ".local" / "bin" / "hermes"
 LEGACY_SOURCE = Path.home() / ".hermes" / "hermes-agent"
-UPSTREAM_BASE = "e0240d7bf412a6c6eddf3dad8fd490fb8431d9aa"
+UPSTREAM_BASE = "e0240d7bf7ce0d665417d45de0bfa9a65cb0ab48"
 REQUIRED_SUBJECTS = {
     "feat(memory): expose Hindsight curation tools",
     "fix(memory): include Hindsight embedded runtime dependency",
