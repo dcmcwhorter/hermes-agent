@@ -129,8 +129,8 @@ The gateway must never send "resume"; human-sent "resume" means summarize and wa
 Required first actions:
 1. Call mcp_gateway_get_briefing({"tier":1}).
 2. Call mcp_gateway_check_messages().
-3. Call mcp_gateway_list_tasks({"agent":"${agent}","status":"all"}). Do not skip this call because the briefing says there are no active tasks.
-4. If and only if the task MCP tool is unavailable, use REST fallback exactly: GET http://127.0.0.1:10000/api/tasks?agent=${agent}&status=all&include_deferred=true. Do not use assigned_to=; this gateway expects agent=.
+3. Call mcp_gateway_list_tasks({"assigned_to":"${agent}","status":"all"}). Do not skip this call because the briefing says there are no active tasks.
+4. If and only if the task MCP tool is unavailable, use REST fallback exactly: GET http://127.0.0.1:10000/api/tasks?assigned_to=${agent}&status=all&include_deferred=true.
 5. Check reminders via the gateway reminder surface if available.
 6. Verify startup readiness before starting task work:
    - Gateway/db: gateway status/briefing/messages/tasks calls succeeded.

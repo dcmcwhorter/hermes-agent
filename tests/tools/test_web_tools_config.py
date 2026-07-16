@@ -584,7 +584,7 @@ class TestCheckWebApiKey:
         # must not raise AttributeError on None.lower() — mirrors _get_backend.
         with patch("tools.web_tools._load_web_config", return_value={"backend": None}):
             from tools.web_tools import check_web_api_key
-            assert check_web_api_key() is False
+            assert check_web_api_key() is True
 
     def test_null_web_section_does_not_crash(self):
         # config.yaml with a present-but-null ``web:`` section makes the raw
@@ -593,7 +593,7 @@ class TestCheckWebApiKey:
         with patch("hermes_cli.config.load_config", return_value={"web": None}):
             from tools.web_tools import _load_web_config, check_web_api_key
             assert _load_web_config() == {}
-            assert check_web_api_key() is False
+            assert check_web_api_key() is True
 
     def test_firecrawl_key_only(self):
         with patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
@@ -610,10 +610,10 @@ class TestCheckWebApiKey:
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
-    def test_no_keys_returns_false(self):
+    def test_no_keys_keeps_direct_extract_available(self):
         from tools.web_tools import check_web_api_key
         with patch("tools.web_tools._ddgs_package_importable", return_value=False):
-            assert check_web_api_key() is False
+            assert check_web_api_key() is True
 
     def test_both_keys_returns_true(self):
         with patch.dict(os.environ, {
@@ -676,12 +676,12 @@ class TestCheckWebApiKey:
 
         assert refresh_calls == []
 
-    def test_configured_backend_must_match_available_provider(self):
+    def test_unavailable_configured_backend_keeps_direct_extract_available(self):
         with patch("tools.web_tools._load_web_config", return_value={"backend": "parallel"}):
             with patch("tools.web_tools._read_nous_access_token", return_value="nous-token"):
                 with patch.dict(os.environ, {"FIRECRAWL_GATEWAY_URL": "http://127.0.0.1:3002"}, clear=False):
                     from tools.web_tools import check_web_api_key
-                    assert check_web_api_key() is False
+                    assert check_web_api_key() is True
 
     def test_configured_firecrawl_backend_accepts_managed_gateway(self):
         with patch("tools.web_tools._load_web_config", return_value={"backend": "firecrawl"}):

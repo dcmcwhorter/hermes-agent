@@ -58,6 +58,6 @@ describe('managed inbox helpers', () => {
     expect(prompt).toContain('AI-Swarm managed lifecycle trigger: restart')
     expect(prompt).toContain('mcp_gateway_get_briefing({"tier":1})')
     expect(prompt).toContain('mcp_gateway_check_messages()')
-    expect(prompt).toContain('mcp_gateway_list_tasks({"agent":"porto","status":"all"})')
+    expect(prompt).toContain('mcp_gateway_list_tasks({"assigned_to":"porto","status":"all"})')
   })
 })
