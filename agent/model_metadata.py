@@ -610,6 +610,13 @@ def is_local_endpoint(base_url: str) -> bool:
     link-local, and Tailscale CGNAT (``100.64.0.0/10``). Tailscale CGNAT
     is included so remote-but-trusted Ollama boxes reached over a
     Tailscale mesh get the same timeout auto-bumps as localhost Ollama.
+
+    Virtual/facade schemes (``moa://local``) are NOT local: MoA is a
+    process-local router whose backends are remote. Treating ``moa://local``
+    as local disabled the non-stream stale timeout (``float('inf')``), and
+    the 30s wait-notice path then crashed with
+    ``OverflowError: cannot convert float infinity to integer`` via
+    ``int(deadline)`` whenever a MoA turn took >30s.
     """
     normalized = _normalize_base_url(base_url)
     if not normalized:
@@ -618,7 +625,12 @@ def is_local_endpoint(base_url: str) -> bool:
     try:
         parsed = urlparse(url)
         host = parsed.hostname or ""
+        scheme = (parsed.scheme or "").lower()
     except Exception:
+        return False
+    # Virtual providers use a placeholder URL (e.g. moa://local). Do not
+    # classify them as local machines just because the host has no dots.
+    if scheme in {"moa"}:
         return False
     if host in _LOCAL_HOSTS:
         return True

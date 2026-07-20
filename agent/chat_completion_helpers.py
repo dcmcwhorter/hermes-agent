@@ -53,6 +53,25 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
 
+def _format_timeout_seconds(value: Any) -> str:
+    """Human label for a timeout that may be ``float('inf')`` / disabled.
+
+    ``int(float('inf'))`` raises ``OverflowError``; local-endpoint stale
+    detection uses inf deliberately. Never format a deadline with bare
+    ``int(timeout)``.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "disabled"
+    if number != number or number == float("inf") or number < 0:
+        return "disabled"
+    try:
+        return f"{int(number)}s"
+    except (OverflowError, ValueError):
+        return "disabled"
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -617,10 +636,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 and getattr(agent, "_codex_stream_last_event_ts", None) is None
             ):
                 _deadline = min(_deadline, _ttfb_timeout)
+            # Guard int(deadline): local-endpoint path sets stale timeout to
+            # float("inf"). int(inf) raises OverflowError and aborts the API
+            # call (MoA used to hit this via moa://local after ~30s).
+            _deadline_label = _format_timeout_seconds(_deadline)
             agent._emit_wait_notice(
                 f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
                 f"{int(_elapsed)}s with no response yet (provider may be slow "
-                f"or overloaded; auto-reconnect at {int(_deadline)}s)"
+                f"or overloaded; auto-reconnect at {_deadline_label})"
             )
 
         _elapsed = time.time() - _call_start
@@ -772,16 +795,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
+                _threshold_label = _format_timeout_seconds(_stale_timeout)
                 if _silent_hint:
                     result["error"] = TimeoutError(
                         f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s). "
+                        f"with no response (threshold: {_threshold_label}). "
                         f"{_silent_hint}"
                     )
                 else:
                     result["error"] = TimeoutError(
                         f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
+                        f"with no response (threshold: {_threshold_label})"
                     )
             break
 

@@ -16,8 +16,13 @@ DEFAULT_MOA_REFERENCE_MODELS: list[dict[str, str]] = [
 ]
 
 DEFAULT_MOA_AGGREGATOR: dict[str, str] = {
-    "provider": "openrouter",
-    "model": "anthropic/claude-opus-4.8",
+    # Fleet policy: no Anthropic defaults. Prefer openai-codex as the stock
+    # acting aggregator; users override per-preset. The previous default
+    # (openrouter anthropic/claude-opus-4.8) violated no-Anthropic guardrails
+    # whenever a preset's aggregator was malformed (e.g. list form) and
+    # silently fell back here.
+    "provider": "openai-codex",
+    "model": "gpt-5.5",
 }
 
 
@@ -107,7 +112,29 @@ def _clean_slot(slot: Any) -> dict[str, Any] | None:
     effort = _clean_reasoning_effort(slot.get("reasoning_effort"))
     if effort:
         clean["reasoning_effort"] = effort
+    # Optional per-slot wall-clock timeout (seconds). Used by MoA aggregators
+    # (and any future reference timeout wiring); drop invalid/non-positive.
+    timeout = _coerce_int_or_none(slot.get("timeout"))
+    if timeout is not None:
+        clean["timeout"] = timeout
     return clean
+
+
+def _first_clean_slot(raw: Any) -> dict[str, Any] | None:
+    """Return the first valid slot from a bare mapping or a list of mappings.
+
+    Config authors often write aggregator as a one-item YAML list (mirroring
+    ``reference_models``). ``_clean_slot`` alone rejected lists and the
+    normalizer silently replaced them with DEFAULT_MOA_AGGREGATOR — which used
+    to be an Anthropic OpenRouter model, violating no-Anthropic guardrails.
+    """
+    if isinstance(raw, list):
+        for item in raw:
+            cleaned = _clean_slot(item)
+            if cleaned is not None:
+                return cleaned
+        return None
+    return _clean_slot(raw)
 
 
 def _slot_problem(slot: Any) -> str | None:
@@ -174,9 +201,26 @@ def validate_moa_payload(raw: Any) -> list[str]:
         if not complete_refs:
             problems.append(f"preset '{label}': needs at least one complete reference model")
 
-        agg_issue = _slot_problem(preset.get("aggregator"))
-        if agg_issue:
-            problems.append(f"preset '{label}' aggregator: {agg_issue}")
+        # Aggregator may be a bare object or a one-item list (same shape users
+        # often copy from reference_models). Validate the first list entry.
+        agg_raw = preset.get("aggregator")
+        if isinstance(agg_raw, list):
+            if not agg_raw:
+                problems.append(f"preset '{label}' aggregator: list is empty")
+            else:
+                agg_issue = _slot_problem(agg_raw[0])
+                if agg_issue:
+                    problems.append(f"preset '{label}' aggregator: {agg_issue}")
+                for index, extra in enumerate(agg_raw[1:], start=2):
+                    extra_issue = _slot_problem(extra)
+                    if extra_issue:
+                        problems.append(
+                            f"preset '{label}' aggregator entry {index}: {extra_issue}"
+                        )
+        else:
+            agg_issue = _slot_problem(agg_raw)
+            if agg_issue:
+                problems.append(f"preset '{label}' aggregator: {agg_issue}")
 
     return problems
 
@@ -211,7 +255,7 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
     if not refs:
         refs = deepcopy(DEFAULT_MOA_REFERENCE_MODELS)
 
-    aggregator = _clean_slot(raw.get("aggregator")) or deepcopy(DEFAULT_MOA_AGGREGATOR)
+    aggregator = _first_clean_slot(raw.get("aggregator")) or deepcopy(DEFAULT_MOA_AGGREGATOR)
 
     return {
         "enabled": bool(raw.get("enabled", True)),

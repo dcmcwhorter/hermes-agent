@@ -2112,13 +2112,7 @@ class MCPServerTask:
                         self._reconnect_event.set()
                         break
         finally:
-            for t in (shutdown_task, reconnect_task):
-                if not t.done():
-                    t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+            await _cancel_and_await_tasks(shutdown_task, reconnect_task)
 
         if self._shutdown_event.is_set():
             return "shutdown"
@@ -2156,13 +2150,7 @@ class MCPServerTask:
                 timeout=timeout,
             )
         finally:
-            for t in (shutdown_task, reconnect_task):
-                if not t.done():
-                    t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+            await _cancel_and_await_tasks(shutdown_task, reconnect_task)
         if self._shutdown_event.is_set():
             return "shutdown"
         self._reconnect_event.clear()
@@ -3040,6 +3028,44 @@ class MCPServerTask:
             finally:
                 self.session = None
 
+    async def _stop_background_run(self, *, timeout: float = 10) -> None:
+        """Signal and wait for the ensure_future'd :meth:`run` task to exit.
+
+        Used by :meth:`start` failure/cancel paths and :meth:`shutdown`.
+        Without this, a parked ``run()`` (initial-connect budget exhausted)
+        becomes ownerless when ``start()`` raises — CLI exit then closes the
+        MCP loop under that coroutine and GC prints
+        ``RuntimeError: Event loop is closed`` from the parked wait finally.
+        """
+        if not self._task or self._task.done():
+            return
+        self._shutdown_event.set()
+        self._reconnect_event.set()
+        try:
+            await asyncio.wait_for(self._task, timeout=timeout)
+            return
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP server '%s' background run stop timed out, cancelling task",
+                self.name,
+            )
+        except asyncio.CancelledError:
+            # Caller (e.g. connect wait_for) was cancelled while we waited;
+            # still force the background task down before re-raising.
+            pass
+        except Exception:
+            logger.debug(
+                "MCP server '%s' background run raised while stopping",
+                self.name,
+                exc_info=True,
+            )
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
         self._task = asyncio.ensure_future(self.run(config))
@@ -3053,38 +3079,21 @@ class MCPServerTask:
             # owner to reap it (#59349). Propagate the cancellation so the
             # transport context managers unwind and their finally blocks
             # release the child process / FDs.
-            if self._task and not self._task.done():
-                self._task.cancel()
+            await self._stop_background_run()
             raise
         if self._error:
+            # run() may still be parked for self-probe revival after setting
+            # _error/_ready. start() callers do not register the server into
+            # `_servers` when this raises, so the parked task would be
+            # ownerless. Tear it down before propagating the connect error.
+            await self._stop_background_run()
             raise self._error
 
     async def shutdown(self):
         """Signal the Task to exit and wait for clean resource teardown."""
-        self._shutdown_event.set()
-        # Defensive: if _wait_for_lifecycle_event is blocking, we need ANY
-        # event to unblock it. _shutdown_event alone is sufficient (the
-        # helper checks shutdown first), but setting reconnect too ensures
-        # there's no race where the helper misses the shutdown flag after
-        # returning "reconnect".
-        self._reconnect_event.set()
-        if self._task and not self._task.done():
-            try:
-                await asyncio.wait_for(self._task, timeout=10)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "MCP server '%s' shutdown timed out, cancelling task",
-                    self.name,
-                )
-                self._task.cancel()
-                try:
-                    await self._task
-                except asyncio.CancelledError:
-                    pass
+        await self._stop_background_run(timeout=10)
         if self._pending_refresh_tasks:
-            for task in list(self._pending_refresh_tasks):
-                task.cancel()
-            await asyncio.gather(*self._pending_refresh_tasks, return_exceptions=True)
+            await _cancel_and_await_tasks(*self._pending_refresh_tasks)
             self._pending_refresh_tasks.clear()
         self._deregister_tools()
         self.session = None
@@ -3115,18 +3124,42 @@ class MCPServerTask:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            for task in (shutdown_task, reconnect_task):
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
+            await _cancel_and_await_tasks(shutdown_task, reconnect_task)
 
 
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
+
+
+async def _cancel_and_await_tasks(*tasks: Optional[asyncio.Task]) -> None:
+    """Cancel pending tasks and await them; no-op if the loop is gone.
+
+    Parked MCP wait helpers create child tasks for Event.wait(). When the
+    parent coroutine is finalized after the MCP loop has already closed
+    (ownerless parked ``run()``, abrupt ``_stop_mcp_loop``), the finally
+    block must not call ``Task.cancel()`` — that schedules on the dead loop
+    and prints ``RuntimeError: Event loop is closed`` via sys.unraisablehook.
+    """
+    pending = [t for t in tasks if t is not None and not t.done()]
+    if not pending:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if loop.is_closed():
+        return
+    for task in pending:
+        try:
+            task.cancel()
+        except RuntimeError:
+            return
+    for task in pending:
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
@@ -5819,9 +5852,29 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
         _mcp_loop = None
         _mcp_thread = None
     if loop is not None:
-        loop.call_soon_threadsafe(loop.stop)
+        try:
+            if loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            pass
         if thread is not None:
             thread.join(timeout=5)
+        # Drain leftover tasks BEFORE close. Ownerless parked run() tasks
+        # (failed start that raised without reaping run) or a timed-out
+        # shutdown_mcp_servers leave coroutines suspended in Event.wait;
+        # closing under them makes GC resume their finally blocks on a dead
+        # loop and emit RuntimeError: Event loop is closed at CLI exit.
+        try:
+            if not loop.is_closed():
+                pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+        except Exception:
+            logger.debug("MCP loop task drain during stop failed", exc_info=True)
         try:
             loop.close()
         except Exception:

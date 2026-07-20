@@ -795,6 +795,17 @@ The gateway does NOT need to be running for read operations (listing conversatio
 - No `claude/channel` push notification protocol yet
 - Text-only sends (no media/attachment sending through `messages_send`)
 
+## Connect failures and clean shutdown
+
+When a stdio MCP server fails its initial connect budget, Hermes may park the background `run()` task so a later self-probe can revive it. If `start()` then raises (so the server is never registered into the live server map), that parked task must be torn down — otherwise process exit can close the MCP event loop under the parked coroutine and GC prints:
+
+```text
+Exception ignored in: <coroutine object MCPServerTask.run ...>
+RuntimeError: Event loop is closed
+```
+
+Hermes now reaps the background run on `start()` failure/cancel and on `shutdown()` so parked tasks do not outlive the owner. Operators who still see the message on CLI exit should confirm they are on a build that includes the `_stop_background_run` path in `tools/mcp_tool.py`.
+
 ## Related docs
 
 - [Use MCP with Hermes](/guides/use-mcp-with-hermes)

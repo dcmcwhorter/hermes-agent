@@ -97,6 +97,47 @@ def test_normalize_moa_config_wraps_bare_dict_reference_models():
     assert cfg["presets"]["p"]["reference_models"] == [{"provider": "openai", "model": "gpt-4o"}]
 
 
+def test_normalize_moa_config_accepts_list_form_aggregator():
+    """Aggregator written as a one-item list (mirroring reference_models) must
+    keep the user's slot instead of silently falling back to the stock default.
+
+    Regression: list-form aggregators were dropped by _clean_slot, so presets
+    fell through to DEFAULT_MOA_AGGREGATOR (historically openrouter
+    anthropic/claude-opus-4.8), violating no-Anthropic guardrails.
+    """
+    cfg = normalize_moa_config(
+        {
+            "presets": {
+                "code-frontier": {
+                    "reference_models": [
+                        {"provider": "xai-oauth", "model": "grok-4.5"},
+                    ],
+                    "aggregator": [
+                        {
+                            "provider": "openai-codex",
+                            "model": "gpt-5.6-sol",
+                            "reasoning_effort": "high",
+                            "timeout": 120,
+                        }
+                    ],
+                }
+            }
+        }
+    )
+    agg = cfg["presets"]["code-frontier"]["aggregator"]
+    assert agg["provider"] == "openai-codex"
+    assert agg["model"] == "gpt-5.6-sol"
+    assert agg["reasoning_effort"] == "high"
+    assert agg["timeout"] == 120
+    assert "anthropic" not in agg["model"].lower()
+
+
+def test_default_moa_aggregator_is_not_anthropic():
+    assert "anthropic" not in DEFAULT_MOA_AGGREGATOR["provider"].lower()
+    assert "claude" not in DEFAULT_MOA_AGGREGATOR["model"].lower()
+    assert "anthropic" not in DEFAULT_MOA_AGGREGATOR["model"].lower()
+
+
 def test_normalize_moa_config_preserves_slot_reasoning_effort():
     cfg = normalize_moa_config(
         {
