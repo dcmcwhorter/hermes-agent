@@ -80,6 +80,27 @@ def _safe_which(cmd: str) -> str | None:
         return None
 
 
+def _find_venv_entry_point(
+    project_root: Path,
+    *,
+    executable: str | Path | None = None,
+) -> Path | None:
+    """Find the Hermes entry point in a checkout-local or active venv.
+
+    Editable installations may deliberately share a virtual environment that
+    lives outside the source checkout.  In that case ``sys.executable`` is the
+    authoritative environment, while checkout-local ``venv``/``.venv`` paths
+    remain the preferred install layout when present.
+    """
+    candidates = [
+        project_root / "venv" / "bin" / "hermes",
+        project_root / ".venv" / "bin" / "hermes",
+    ]
+    active_executable = Path(executable or sys.executable)
+    candidates.append(active_executable.parent / "hermes")
+    return next((candidate for candidate in candidates if candidate.exists()), None)
+
+
 def _termux_browser_setup_steps(node_installed: bool) -> list[str]:
     steps: list[str] = []
     step = 1
@@ -1359,13 +1380,7 @@ def run_doctor(args):
 
     if sys.platform != "win32":
         _section("Command Installation")
-        # Determine the venv entry point location
-        _venv_bin = None
-        for _venv_name in ("venv", ".venv"):
-            _candidate = PROJECT_ROOT / _venv_name / "bin" / "hermes"
-            if _candidate.exists():
-                _venv_bin = _candidate
-                break
+        _venv_bin = _find_venv_entry_point(PROJECT_ROOT)
 
         # Determine the expected command link directory (mirrors install.sh logic)
         _prefix = os.environ.get("PREFIX", "")
@@ -1387,7 +1402,11 @@ def run_doctor(args):
                 f"Reinstall entry point: cd {PROJECT_ROOT} && source venv/bin/activate && pip install -e '.[all]'"
             )
         else:
-            check_ok(f"Venv entry point exists ({_venv_bin.relative_to(PROJECT_ROOT)})")
+            try:
+                _venv_display = _venv_bin.relative_to(PROJECT_ROOT)
+            except ValueError:
+                _venv_display = _venv_bin
+            check_ok(f"Venv entry point exists ({_venv_display})")
 
             # Check the symlink at the command link location
             if _cmd_link.is_symlink():

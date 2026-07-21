@@ -69,6 +69,40 @@ def _run_doctor(fix=False):
 class TestDoctorCommandInstallation:
     """Tests for the ◆ Command Installation section."""
 
+    def test_finds_entry_point_in_active_external_venv(self, tmp_path):
+        """Editable checkouts may use a venv outside the repository root."""
+        project = tmp_path / "project"
+        project.mkdir()
+        external_venv = tmp_path / "shared-venv"
+        hermes_bin = external_venv / "bin" / "hermes"
+        hermes_bin.parent.mkdir(parents=True)
+        hermes_bin.write_text("#!/usr/bin/env python\n# entry point\n")
+
+        found = doctor_mod._find_venv_entry_point(
+            project,
+            executable=external_venv / "bin" / "python",
+        )
+
+        assert found == hermes_bin
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Symlink check is Unix-only")
+    def test_external_venv_entry_point_is_reported_without_relative_path_error(
+        self, monkeypatch, tmp_path
+    ):
+        home, project, _ = _setup_doctor_env(monkeypatch, tmp_path)
+        (project / "venv" / "bin" / "hermes").unlink()
+        external_venv = tmp_path / "shared-venv"
+        hermes_bin = external_venv / "bin" / "hermes"
+        hermes_bin.parent.mkdir(parents=True)
+        hermes_bin.write_text("#!/usr/bin/env python\n# entry point\n")
+        monkeypatch.setattr(sys, "executable", str(external_venv / "bin" / "python"))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out = _run_doctor(fix=False)
+
+        assert f"Venv entry point exists ({hermes_bin})" in out
+        assert "Venv entry point not found" not in out
+
     @pytest.mark.skipif(sys.platform == "win32", reason="Symlink check is Unix-only")
     def test_correct_symlink_shows_ok(self, monkeypatch, tmp_path):
         home, project, hermes_bin = _setup_doctor_env(monkeypatch, tmp_path)
@@ -167,6 +201,7 @@ class TestDoctorCommandInstallation:
         monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
         monkeypatch.setattr(doctor_mod, "_DHH", str(home))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "missing-venv" / "bin" / "python"))
 
         fake_model_tools = types.SimpleNamespace(
             check_tool_availability=lambda *a, **kw: ([], []),
